@@ -1,0 +1,11 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+stable-baselines3>=2.3
+gymnasium>=0.29
+torch>=2.2
+xgboost>=2.0
+scikit-learn>=1.4
+pandas>=2.2
+numpy>=1.26
+fastf1>=3.3
+websockets>=12.0
