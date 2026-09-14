@@ -283,10 +283,22 @@ class ReplayTelemetrySource:
         target = next((c for c in candidates if os.path.exists(c)), None)
         if target:
             try:
-                import pandas as pd
-                df = pd.read_csv(target)
-                self.rows = df.to_dict(orient="records")
-                print(f"[ReplayTelemetrySource] Loaded {len(self.rows)} rows from {target}")
+                import csv
+                compact = []
+                with open(target, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for r in reader:
+                        speed = float(r.get("speed_kph") or 312.0)
+                        soc = float(r.get("battery_soc_pct") or 68.0) / 100.0
+                        gap = float(r.get("gap_sec") or 0.5)
+                        closing = float(r.get("closing_speed_kph") or 5.0)
+                        drs = 1 if str(r.get("drs_available") or "").lower() in ("true", "1") else 0
+                        lap = int(r.get("lap") or 1)
+                        t_in_lap = float(r.get("t_in_lap") or 0.0)
+                        tyre_age = float(r.get("tyre_age") or lap)
+                        compact.append((speed, soc, gap, closing, drs, lap, t_in_lap, tyre_age))
+                self.rows = compact
+                print(f"[ReplayTelemetrySource] Loaded {len(self.rows)} compact rows from {target}")
             except Exception as e:
                 print(f"[ReplayTelemetrySource] Error loading {target}: {e}")
 
@@ -307,14 +319,19 @@ class ReplayTelemetrySource:
             row = self.rows[self.idx]
             self.idx = (self.idx + 1) % len(self.rows)
 
-            speed = float(row.get("speed_kph", 312.0))
-            soc = float(row.get("battery_soc_pct", 68.0)) / 100.0
-            gap = max(0.05, float(row.get("gap_sec", 0.5)))
-            closing = float(row.get("closing_speed_kph", 5.0))
-            drs = 1 if str(row.get("drs_available", False)).lower() in ("true", "1") else 0
-            lap = int(row.get("lap", 1))
-            t_in_lap = float(row.get("t_in_lap", 0.0))
-            tyre_age = float(row.get("tyre_age", lap))
+            if isinstance(row, tuple):
+                speed, soc, gap, closing, drs, lap, t_in_lap, tyre_age = row
+            else:
+                speed = float(row.get("speed_kph", 312.0))
+                soc = float(row.get("battery_soc_pct", 68.0)) / 100.0
+                gap = float(row.get("gap_sec", 0.5))
+                closing = float(row.get("closing_speed_kph", 5.0))
+                drs = 1 if str(row.get("drs_available", False)).lower() in ("true", "1") else 0
+                lap = int(row.get("lap", 1))
+                t_in_lap = float(row.get("t_in_lap", 0.0))
+                tyre_age = float(row.get("tyre_age", lap))
+
+            gap = max(0.05, gap)
             tyre_life = max(15.0, 100.0 - tyre_age * 2.5)
 
             in_braking = bool(closing > 8.0 and speed < 200.0)

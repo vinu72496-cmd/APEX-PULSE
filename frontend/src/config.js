@@ -7,7 +7,10 @@
  */
 
 // 1. Base Backend HTTP/HTTPS URL
-export const API_BASE_URL = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '')
+const DEFAULT_PROD_API = 'https://apex-pulse-y4ba.onrender.com'
+export const API_BASE_URL = (
+  import.meta.env.VITE_API_URL || (import.meta.env.PROD ? DEFAULT_PROD_API : '')
+).replace(/\/$/, '')
 
 /**
  * Resolves a full API URL given a relative or absolute path.

@@ -231,14 +231,37 @@ QUICK_SIGNAL_SPEECHES = {
 
 async def telemetry_loop():
     global last_external_injection_time, ACTIVE_COMMAND, active_radio_message, latest_command, active_call_session
-    if TELEMETRY_MODE == "udp":
-        source = UDPTelemetrySource(bind_port=UDP_BIND_PORT)
-    elif TELEMETRY_MODE == "synthetic":
-        source = SyntheticTelemetrySource(TelemetryConfig(hz=20.0))
-    else:
-        source = ReplayTelemetrySource(TelemetryConfig(hz=20.0))
+    cached_driver_recs = {}
+    last_driver_rec_time = 0.0
+    active_mode = None
+    source = None
+    stream_gen = None
 
-    async for state in source.stream():
+    while True:
+        # If mode changed or not initialized, create source
+        if active_mode != TELEMETRY_MODE or source is None or stream_gen is None:
+            active_mode = TELEMETRY_MODE
+            if active_mode == "udp":
+                source = UDPTelemetrySource(bind_port=UDP_BIND_PORT)
+            elif active_mode == "synthetic":
+                source = SyntheticTelemetrySource(TelemetryConfig(hz=10.0))
+            else:
+                source = ReplayTelemetrySource(TelemetryConfig(hz=10.0))
+            stream_gen = source.stream()
+
+        # If no clients are connected, sleep to avoid burning CPU on cloud containers
+        if not connected_clients:
+            await asyncio.sleep(0.5)
+            continue
+
+        try:
+            state = await anext(stream_gen)
+        except (StopAsyncIteration, Exception):
+            source = None
+            stream_gen = None
+            await asyncio.sleep(0.1)
+            continue
+
         # If external bench test or manual injection arrived in the last 3 seconds, yield
         if (time.time() - last_external_injection_time) < 3.0:
             await asyncio.sleep(0.05)
@@ -277,11 +300,21 @@ async def telemetry_loop():
             DRIVERS_REGISTRY["driver_2"]["speed_kph"] = command.get("speed_kph", 324.8)
             DRIVERS_REGISTRY["driver_2"]["lap"] = command.get("lap", 30)
 
+        # Cache background driver recommendations to save CPU
+        now_t = time.time()
+        if (now_t - last_driver_rec_time) > 2.0:
+            last_driver_rec_time = now_t
+            cached_driver_recs = {
+                d_id: get_driver_recommendation(d_id)
+                for d_id in DRIVERS_REGISTRY
+                if d_id != "driver_2"
+            }
+
         rec_summary = {k: v for k, v in command.items() if k != "drivers"}
         command["drivers"] = {
             d_id: {
                 **d_data,
-                "recommendation": rec_summary if d_id == "driver_2" else get_driver_recommendation(d_id)
+                "recommendation": rec_summary if d_id == "driver_2" else cached_driver_recs.get(d_id)
             }
             for d_id, d_data in DRIVERS_REGISTRY.items()
         }
@@ -295,7 +328,7 @@ async def broadcast(payload: dict):
         return
     message = json.dumps(payload)
     dead = []
-    for ws in connected_clients:
+    for ws in list(connected_clients):
         try:
             await ws.send_text(message)
         except Exception:
@@ -320,6 +353,9 @@ def get_cors_origins():
         "http://127.0.0.1:3000",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
+        "https://apex-pulse-5u36waxeo-vinaysharma20048-1560.vercel.app",
+        "https://apex-pulse-vinaysharma20048-1560.vercel.app",
+        "https://apex-pulse.vercel.app",
     ]
     if origins_env:
         if origins_env.strip() == "*":
@@ -334,6 +370,7 @@ app = FastAPI(title="APEX PULSE Backend", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_cors_origins(),
+    allow_origin_regex=r"^https:\/\/.*\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

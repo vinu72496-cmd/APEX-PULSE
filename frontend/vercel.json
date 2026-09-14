@@ -1,6 +1,22 @@
 {
   "rewrites": [
     {
+      "source": "/api/:path*",
+      "destination": "https://apex-pulse-y4ba.onrender.com/api/:path*"
+    },
+    {
+      "source": "/health",
+      "destination": "https://apex-pulse-y4ba.onrender.com/health"
+    },
+    {
+      "source": "/laps",
+      "destination": "https://apex-pulse-y4ba.onrender.com/laps"
+    },
+    {
+      "source": "/kaggle-overtakes",
+      "destination": "https://apex-pulse-y4ba.onrender.com/kaggle-overtakes"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }
