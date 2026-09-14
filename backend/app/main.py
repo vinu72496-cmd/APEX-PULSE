@@ -21,11 +21,16 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from inference import DualModelCore, SharedFeatureState
-from telemetry_source import SyntheticTelemetrySource, UDPTelemetrySource, TelemetryConfig
+from telemetry_source import (
+    SyntheticTelemetrySource,
+    UDPTelemetrySource,
+    TelemetryConfig,
+    ReplayTelemetrySource,
+)
 
 import time
 
-TELEMETRY_MODE = os.environ.get("TELEMETRY_MODE", "synthetic")
+TELEMETRY_MODE = os.environ.get("TELEMETRY_MODE", "replay").lower()
 UDP_BIND_PORT = int(os.environ.get("UDP_BIND_PORT", "20777"))
 
 core = DualModelCore()
@@ -34,6 +39,51 @@ latest_command: dict = {}
 active_radio_message: dict = None
 last_external_injection_time: float = 0.0
 active_call_session: dict = None
+
+# --- COMMAND ENGINE & AUDIT TRAIL ---
+COMMANDS_STORE: list[dict] = [
+    {
+        "id": 101,
+        "command_id": "cmd_init_101",
+        "time": "15:20:45",
+        "sender": "PIT WALL COACH",
+        "coach_name": "Peter Bonnington (Bono)",
+        "driver_id": "driver_2",
+        "action": "RADIO CHECK",
+        "message": "Radio check nominal. Confirm audio loud and clear.",
+        "call": "Radio check nominal. Confirm audio loud and clear.",
+        "transcript": "Radio check nominal. Confirm audio loud and clear.",
+        "urgency": "INFO",
+        "status": "ACKNOWLEDGED",
+        "sent_at": "15:20:45",
+        "delivered_at": "15:20:46",
+        "acknowledged_at": "15:20:47",
+        "driver_reply": "5 BY 5 - AUDIO LOUD & CLEAR",
+        "latency_ms": 12,
+        "telemetry_matched": True,
+    },
+    {
+        "id": 102,
+        "command_id": "cmd_init_102",
+        "time": "15:21:18",
+        "sender": "PIT WALL COACH",
+        "coach_name": "Peter Bonnington (Bono)",
+        "driver_id": "driver_2",
+        "action": "DEFEND",
+        "message": "Hold position, defend apex and protect tyres.",
+        "call": "Hold position, defend apex and protect tyres.",
+        "transcript": "Hold position, defend apex and protect tyres.",
+        "urgency": "HIGH",
+        "status": "ACKNOWLEDGED",
+        "sent_at": "15:21:18",
+        "delivered_at": "15:21:19",
+        "acknowledged_at": "15:21:20",
+        "driver_reply": "COPY, DEFENDING APEX · MANAGING TYRE TEMPS",
+        "latency_ms": 14,
+        "telemetry_matched": True,
+    }
+]
+ACTIVE_COMMAND: dict | None = None
 
 # --- MULTI-DRIVER REGISTRY ---
 DRIVERS_REGISTRY = {
@@ -180,11 +230,13 @@ QUICK_SIGNAL_SPEECHES = {
 
 
 async def telemetry_loop():
-    global last_external_injection_time
+    global last_external_injection_time, ACTIVE_COMMAND, active_radio_message, latest_command, active_call_session
     if TELEMETRY_MODE == "udp":
         source = UDPTelemetrySource(bind_port=UDP_BIND_PORT)
-    else:
+    elif TELEMETRY_MODE == "synthetic":
         source = SyntheticTelemetrySource(TelemetryConfig(hz=20.0))
+    else:
+        source = ReplayTelemetrySource(TelemetryConfig(hz=20.0))
 
     async for state in source.stream():
         # If external bench test or manual injection arrived in the last 3 seconds, yield
@@ -193,14 +245,26 @@ async def telemetry_loop():
             continue
 
         command = core.recommend(state)
-        global latest_command, active_radio_message, active_call_session
-        if active_radio_message:
-            if (time.time() * 1000 - active_radio_message["id"]) < 12000:
+
+        # Synchronize active command and command audit trail
+        if ACTIVE_COMMAND:
+            # If acknowledged more than 60s ago, clear active slot
+            ack_ts = ACTIVE_COMMAND.get("_ack_timestamp")
+            if ack_ts and (time.time() - ack_ts) > 60.0:
+                ACTIVE_COMMAND = None
+            else:
+                command["active_command"] = ACTIVE_COMMAND
+                command["radio_message"] = ACTIVE_COMMAND
+                if ACTIVE_COMMAND.get("action") in ("OVERTAKE", "PUSH", "BALANCE", "HARVEST"):
+                    command["mode"] = ACTIVE_COMMAND["action"]
+        elif active_radio_message:
+            if (time.time() * 1000 - active_radio_message["id"]) < 30000:
                 command["radio_message"] = active_radio_message
-                if active_radio_message.get("action") in ("OVERTAKE", "PUSH", "BALANCE", "HARVEST"):
-                    command["mode"] = active_radio_message["action"]
+                command["active_command"] = active_radio_message
             else:
                 active_radio_message = None
+
+        command["commands"] = COMMANDS_STORE[-15:]
 
         if active_call_session:
             command["active_call"] = active_call_session
@@ -558,85 +622,233 @@ async def get_kaggle_overtakes():
         return {"error": str(e), "events": []}
 
 
+# --- COACH-TO-DRIVER COMMAND & RADIO LIFECYCLE ---
+last_driver_ack = None
+
+@app.post("/command/send")
+@app.post("/api/command/send")
 @app.post("/radio/command")
 @app.post("/api/radio/command")
-async def handle_radio_command(payload: dict):
-    global active_radio_message, latest_command
+async def send_command(payload: dict):
+    global ACTIVE_COMMAND, latest_command, active_radio_message
     action = payload.get("action", "DIRECT ORDER").upper()
-    transcript = payload.get("transcript", "")
-    urgency = payload.get("urgency", "NORMAL")
     driver_id = payload.get("driver_id", "driver_2")
+    urgency = payload.get("urgency", "HIGH").upper()
+    coach_name = payload.get("coach_name", "Peter Bonnington (Bono)")
 
-    active_radio_message = {
-        "id": int(time.time() * 1000),
+    # Resolve text/call
+    speech_text = (
+        payload.get("message")
+        or payload.get("text")
+        or payload.get("transcript")
+        or payload.get("speech")
+        or payload.get("call")
+    )
+    if not speech_text:
+        speech_text = QUICK_SIGNAL_SPEECHES.get(action, f"Order [{action}]. Execute immediately.")
+
+    now_t = time.time()
+    time_str = time.strftime("%H:%M:%S")
+    msg_id = int(now_t * 1000)
+
+    cmd_obj = {
+        "id": msg_id,
+        "command_id": f"cmd_{msg_id}",
         "sender": "PIT WALL COACH",
+        "coach_name": coach_name,
         "driver_id": driver_id,
-        "call": transcript,
         "action": action,
+        "message": speech_text,
+        "call": speech_text,
+        "transcript": speech_text,
+        "speech": speech_text,
         "urgency": urgency,
         "status": "SENT",
-        "time": time.strftime("%H:%M:%S")
+        "time": time_str,
+        "sent_at": time_str,
+        "_sent_timestamp": now_t,
+        "delivered_at": None,
+        "acknowledged_at": None,
+        "_ack_timestamp": None,
+        "driver_reply": None,
+        "telemetry_matched": False,
+        "latency_ms": None,
     }
 
-    add_timeline_event("RADIO_TX", f"Coach to {driver_id.upper()}: '{transcript or action}'", urgency)
+    ACTIVE_COMMAND = cmd_obj
+    active_radio_message = cmd_obj
+    COMMANDS_STORE.append(cmd_obj)
+    if len(COMMANDS_STORE) > 100:
+        COMMANDS_STORE.pop(0)
+
+    add_timeline_event("COACH_ORDER", f"Coach [{action}] to {driver_id.upper()}: '{speech_text}'", urgency)
+
+    # Broadcast command update immediately
+    await broadcast({
+        "type": "command_update",
+        "command": cmd_obj,
+        "active_command": cmd_obj,
+        # Legacy backward-compatibility fields:
+        "signal": cmd_obj,
+        "radio": cmd_obj,
+        "radio_message": cmd_obj
+    })
 
     if latest_command:
-        latest_command["radio_message"] = active_radio_message
+        latest_command["active_command"] = cmd_obj
+        latest_command["radio_message"] = cmd_obj
         if action in ("OVERTAKE", "PUSH", "BALANCE", "HARVEST"):
             latest_command["mode"] = action
             latest_command["radio_override"] = True
-        await broadcast(latest_command)
 
-    return {"status": "ok", "radio": active_radio_message}
+    return {"status": "ok", "command": cmd_obj, "radio": cmd_obj, "signal": cmd_obj}
 
 
+@app.post("/command/delivered")
+@app.post("/api/command/delivered")
 @app.post("/radio/delivered")
 @app.post("/api/radio/delivered")
-async def handle_radio_delivered(payload: dict):
-    global active_radio_message, latest_command
-    msg_id = payload.get("id")
-    if active_radio_message and str(active_radio_message.get("id")) == str(msg_id):
-        active_radio_message["status"] = "DELIVERED"
-        if latest_command:
-            latest_command["radio_message"] = active_radio_message
-            await broadcast(latest_command)
-    return {"status": "ok"}
+async def command_delivered(payload: dict):
+    global ACTIVE_COMMAND, active_radio_message, latest_command
+    msg_id = payload.get("id") or payload.get("command_id")
+    time_str = time.strftime("%H:%M:%S")
+
+    target_cmd = None
+    if ACTIVE_COMMAND and (msg_id is None or str(ACTIVE_COMMAND.get("id")) == str(msg_id) or str(ACTIVE_COMMAND.get("command_id")) == str(msg_id)):
+        target_cmd = ACTIVE_COMMAND
+    else:
+        for c in reversed(COMMANDS_STORE):
+            if str(c.get("id")) == str(msg_id) or str(c.get("command_id")) == str(msg_id):
+                target_cmd = c
+                break
+
+    if target_cmd and target_cmd.get("status") == "SENT":
+        target_cmd["status"] = "DELIVERED"
+        target_cmd["delivered_at"] = time_str
+        if active_radio_message and str(active_radio_message.get("id")) == str(target_cmd.get("id")):
+            active_radio_message["status"] = "DELIVERED"
+
+        await broadcast({
+            "type": "command_update",
+            "command": target_cmd,
+            "active_command": ACTIVE_COMMAND,
+            "id": target_cmd.get("id"),
+            "status": "DELIVERED"
+        })
+
+    return {"status": "ok", "command": target_cmd or ACTIVE_COMMAND}
 
 
-last_driver_ack = None
-
+@app.post("/command/ack")
+@app.post("/api/command/ack")
 @app.post("/radio/ack")
 @app.post("/api/radio/ack")
-async def handle_radio_ack(payload: dict):
-    global last_driver_ack, latest_command, active_radio_message
+async def command_ack(payload: dict):
+    global ACTIVE_COMMAND, last_driver_ack, latest_command, active_radio_message
+    msg_id = payload.get("id") or payload.get("command_id")
     driver_id = payload.get("driver_id", "driver_2")
-    reply_text = payload.get("reply", "ROGER / COPY THAT")
+    status = payload.get("status", "ACKNOWLEDGED").upper()
+    reply_text = payload.get("reply") or ("COPY THAT / EXECUTING" if status == "ACKNOWLEDGED" else "UNABLE TO COMPLY")
+    time_str = payload.get("time", time.strftime("%H:%M:%S"))
+    now_t = time.time()
+
+    target_cmd = None
+    if ACTIVE_COMMAND and (msg_id is None or str(ACTIVE_COMMAND.get("id")) == str(msg_id) or str(ACTIVE_COMMAND.get("command_id")) == str(msg_id)):
+        target_cmd = ACTIVE_COMMAND
+    else:
+        for c in reversed(COMMANDS_STORE):
+            if str(c.get("id")) == str(msg_id) or str(c.get("command_id")) == str(msg_id):
+                target_cmd = c
+                break
+
+    latency = 14
+    if target_cmd:
+        target_cmd["status"] = status
+        target_cmd["acknowledged_at"] = time_str
+        target_cmd["driver_reply"] = reply_text
+        target_cmd["_ack_timestamp"] = now_t
+        sent_ts = target_cmd.get("_sent_timestamp")
+        if sent_ts:
+            latency = max(5, int((now_t - sent_ts) * 1000))
+            target_cmd["latency_ms"] = latency
+    else:
+        target_cmd = {
+            "id": msg_id or int(now_t * 1000),
+            "command_id": f"cmd_{msg_id or int(now_t * 1000)}",
+            "driver_id": driver_id,
+            "status": status,
+            "driver_reply": reply_text,
+            "time": time_str,
+            "acknowledged_at": time_str,
+            "_ack_timestamp": now_t,
+            "latency_ms": latency,
+        }
+
     last_driver_ack = {
-        "id": payload.get("id"),
-        "action": payload.get("action", "ACK"),
+        "id": target_cmd.get("id"),
+        "command_id": target_cmd.get("command_id"),
+        "action": target_cmd.get("action", "DIRECTIVE"),
         "reply": reply_text,
         "driver_id": driver_id,
-        "status": "ACKNOWLEDGED",
-        "time": payload.get("time", time.strftime("%H:%M:%S")),
-        "latency_ms": 14,
+        "status": status,
+        "time": time_str,
+        "latency_ms": latency,
         "audio_link_status": "CONFIRMED HEARD 5 BY 5"
     }
-    if active_radio_message and str(active_radio_message.get("id")) == str(payload.get("id")):
-        active_radio_message["status"] = "ACKNOWLEDGED"
 
-    add_timeline_event("DRIVER_ACK", f"Driver {driver_id.upper()} ack: '{reply_text}'", "NORMAL")
+    if active_radio_message and str(active_radio_message.get("id")) == str(target_cmd.get("id")):
+        active_radio_message["status"] = status
+
+    add_timeline_event("DRIVER_ACK", f"Driver {driver_id.upper()} {status}: '{reply_text}'", "NORMAL")
 
     if latest_command:
         latest_command["driver_ack"] = last_driver_ack
-        latest_command["radio_message"] = active_radio_message
+        latest_command["active_command"] = ACTIVE_COMMAND
+        latest_command["radio_message"] = ACTIVE_COMMAND
 
     await broadcast({
-        "type": "radio_ack",
+        "type": "command_update",
+        "command": target_cmd,
+        "active_command": ACTIVE_COMMAND,
         "ack": last_driver_ack,
-        "id": payload.get("id"),
-        "status": "ACKNOWLEDGED"
+        "id": target_cmd.get("id"),
+        "status": status
     })
-    return {"status": "ok", "ack": last_driver_ack}
+
+    return {"status": "ok", "command": target_cmd, "ack": last_driver_ack}
+
+
+@app.get("/commands")
+@app.get("/api/commands")
+async def get_commands():
+    return {
+        "total": len(COMMANDS_STORE),
+        "commands": COMMANDS_STORE,
+        "active_command": ACTIVE_COMMAND
+    }
+
+
+@app.get("/command/active")
+@app.get("/api/command/active")
+async def get_active_command():
+    return {"active_command": ACTIVE_COMMAND}
+
+
+@app.get("/telemetry/mode")
+@app.get("/api/telemetry/mode")
+async def get_telemetry_mode():
+    return {"mode": TELEMETRY_MODE}
+
+
+@app.post("/telemetry/mode")
+@app.post("/api/telemetry/mode")
+async def set_telemetry_mode(payload: dict):
+    global TELEMETRY_MODE
+    new_mode = payload.get("mode", "replay").lower()
+    if new_mode in ("replay", "synthetic", "udp"):
+        TELEMETRY_MODE = new_mode
+        return {"status": "ok", "mode": TELEMETRY_MODE}
+    return {"status": "error", "message": "Invalid mode. Choose replay, synthetic, or udp."}
 
 
 # --- MULTI-DRIVER REST ENDPOINTS ---
@@ -789,28 +1001,10 @@ async def end_call(payload: dict):
     return {"status": "ok", "duration_s": duration_s}
 
 
-# --- QUICK AUDIO SIGNALS ENDPOINT ---
-@app.post("/radio/signal")
-@app.post("/api/radio/signal")
+# --- QUICK AUDIO SIGNALS ENDPOINT (DELEGATED TO COMMAND ENGINE) ---
 async def send_quick_signal(payload: dict):
-    action = payload.get("action", "ATTACK").upper()
-    driver_id = payload.get("driver_id", "driver_2")
-    speech_text = QUICK_SIGNAL_SPEECHES.get(action, payload.get("text", f"Signal {action}"))
-    signal_obj = {
-        "id": int(time.time() * 1000),
-        "action": action,
-        "driver_id": driver_id,
-        "speech": speech_text,
-        "tone": "F1_BEEP_RADIO_CHIRP",
-        "sender": "PIT WALL COACH",
-        "time": time.strftime("%H:%M:%S")
-    }
-    add_timeline_event("QUICK_SIGNAL", f"Coach quick signal [{action}] to {driver_id.upper()}: '{speech_text}'", "NORMAL")
-    await broadcast({
-        "type": "radio_signal",
-        "signal": signal_obj
-    })
-    return {"status": "ok", "signal": signal_obj}
+    return await send_command(payload)
+
 
 
 # --- RACE EVENT TIMELINE ENDPOINTS ---

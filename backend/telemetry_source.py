@@ -21,6 +21,7 @@ Both sources expose the same async generator interface so main.py doesn't
 care which one is active.
 """
 import asyncio
+import os
 import socket
 import struct
 import time
@@ -35,6 +36,72 @@ from inference import SharedFeatureState
 class TelemetryConfig:
     stint_laps: int = 30
     hz: float = 20.0
+
+
+def compute_f1_dynamics(
+    speed_kph: float,
+    prev_speed_kph: float,
+    dt: float,
+    soc: float = 0.65,
+    in_braking: bool = False,
+    drs_active: bool = False,
+) -> dict:
+    speed = max(0.0, float(speed_kph))
+    accel = (speed - prev_speed_kph) / max(0.01, dt)
+
+    # Modern 8-speed Formula 1 transmission gear ratio mapping
+    if speed < 85.0:
+        gear = 2
+        g_min, g_max = 40.0, 110.0
+    elif speed < 125.0:
+        gear = 3
+        g_min, g_max = 85.0, 150.0
+    elif speed < 170.0:
+        gear = 4
+        g_min, g_max = 125.0, 195.0
+    elif speed < 215.0:
+        gear = 5
+        g_min, g_max = 170.0, 240.0
+    elif speed < 265.0:
+        gear = 6
+        g_min, g_max = 215.0, 285.0
+    elif speed < 310.0:
+        gear = 7
+        g_min, g_max = 265.0, 325.0
+    else:
+        gear = 8
+        g_min, g_max = 310.0, 360.0
+
+    ratio = float(np.clip((speed - g_min) / max(1.0, g_max - g_min), 0.0, 1.0))
+    rpm = int(10400 + ratio * 2050)
+
+    # Smooth physics-based throttle and brake
+    if in_braking or accel < -8.0:
+        throttle = 0
+        brake = int(np.clip(abs(accel) * 3.0 + (45 if in_braking else 15), 15, 100))
+    elif accel > 1.5 or speed > 290.0:
+        throttle = int(np.clip(80 + accel * 1.5, 75, 100))
+        brake = 0
+    else:
+        throttle = int(np.clip(45 + (speed / 350.0) * 45, 30, 85))
+        brake = 0
+
+    base_temp = 98.0 + 7.0 * (speed / 350.0)
+    brake_heat = (brake / 100.0) * 8.0
+    tyre_temps = {
+        "fl": round(base_temp + brake_heat + 1.2, 1),
+        "fr": round(base_temp + brake_heat * 0.9, 1),
+        "rl": round(base_temp * 0.96, 1),
+        "rr": round(base_temp * 0.95, 1),
+    }
+
+    return {
+        "gear": gear,
+        "rpm": rpm,
+        "throttle": throttle,
+        "brake": brake,
+        "tyre_temps": tyre_temps,
+    }
 
 
 class SyntheticTelemetrySource:
@@ -52,6 +119,7 @@ class SyntheticTelemetrySource:
         self.track_dist = 620.0  # meters into Monza lap (starting Rettifilo straight)
         self.gap_dist_m = 24.5   # meters behind rival
         self.speed = 318.0       # km/h
+        self.prev_speed = 318.0
         self.closing_speed = 8.4 # km/h
         self.tyre_life = 82.0
         self.sector_delta = -0.214
@@ -168,12 +236,117 @@ class SyntheticTelemetrySource:
                 defender_line_change_late=defender_late,
                 front_axle_overlap=axle_overlap,
             )
+            v_dyn = compute_f1_dynamics(self.speed, self.prev_speed, dt, self.soc, in_braking_zone, drs_active)
+            self.prev_speed = self.speed
+
             setattr(state, "speed_kph", round(self.speed, 1))
             setattr(state, "lap", int(self.lap))
             setattr(state, "tyre_life_pct", round(self.tyre_life, 1))
             setattr(state, "track_distance_m", round(self.track_dist, 1))
             setattr(state, "in_braking_zone", in_braking_zone)
             setattr(state, "in_drs_zone", in_drs_zone)
+            setattr(state, "gear", v_dyn["gear"])
+            setattr(state, "rpm", v_dyn["rpm"])
+            setattr(state, "throttle", v_dyn["throttle"])
+            setattr(state, "brake", v_dyn["brake"])
+            setattr(state, "tyre_temps", v_dyn["tyre_temps"])
+            setattr(state, "telemetry_source", "PHYSICS_SIMULATION")
+            yield state
+            await asyncio.sleep(period)
+
+
+class ReplayTelemetrySource:
+    """
+    Continuous Replay Mode streaming realistic telemetry records from the
+    90,002-row Monza Grand Prix dataset (data/telemetry.csv).
+    """
+
+    def __init__(self, config: TelemetryConfig = TelemetryConfig(), csv_path: str = None):
+        self.cfg = config
+        self.rows = []
+        self.idx = 0
+        self.prev_speed = 318.0
+        self.t_last = time.time()
+        self._load_data(csv_path)
+
+    def _load_data(self, explicit_path: str = None):
+        candidates = []
+        if explicit_path:
+            candidates.append(explicit_path)
+        candidates.extend([
+            os.path.join(os.path.dirname(__file__), "data", "telemetry.csv"),
+            os.path.join(os.path.dirname(__file__), "..", "..", "data", "telemetry.csv"),
+            "backend/data/telemetry.csv",
+            "data/telemetry.csv",
+            "../data/telemetry.csv",
+        ])
+        target = next((c for c in candidates if os.path.exists(c)), None)
+        if target:
+            try:
+                import pandas as pd
+                df = pd.read_csv(target)
+                self.rows = df.to_dict(orient="records")
+                print(f"[ReplayTelemetrySource] Loaded {len(self.rows)} rows from {target}")
+            except Exception as e:
+                print(f"[ReplayTelemetrySource] Error loading {target}: {e}")
+
+    async def stream(self):
+        if not self.rows:
+            print("[ReplayTelemetrySource] No dataset available, falling back to SyntheticTelemetrySource")
+            synth = SyntheticTelemetrySource(self.cfg)
+            async for s in synth.stream():
+                yield s
+            return
+
+        period = 1.0 / self.cfg.hz
+        while True:
+            t_now = time.time()
+            dt = min(0.1, max(0.01, t_now - self.t_last))
+            self.t_last = t_now
+
+            row = self.rows[self.idx]
+            self.idx = (self.idx + 1) % len(self.rows)
+
+            speed = float(row.get("speed_kph", 312.0))
+            soc = float(row.get("battery_soc_pct", 68.0)) / 100.0
+            gap = max(0.05, float(row.get("gap_sec", 0.5)))
+            closing = float(row.get("closing_speed_kph", 5.0))
+            drs = 1 if str(row.get("drs_available", False)).lower() in ("true", "1") else 0
+            lap = int(row.get("lap", 1))
+            t_in_lap = float(row.get("t_in_lap", 0.0))
+            tyre_age = float(row.get("tyre_age", lap))
+            tyre_life = max(15.0, 100.0 - tyre_age * 2.5)
+
+            in_braking = bool(closing > 8.0 and speed < 200.0)
+            v_dyn = compute_f1_dynamics(speed, self.prev_speed, dt, soc, in_braking=in_braking, drs_active=bool(drs))
+            self.prev_speed = speed
+
+            state = SharedFeatureState(
+                soc=float(np.clip(soc, 0.05, 0.98)),
+                lap_frac_remaining=max(0.0, 1.0 - (lap % 53) / 53.0),
+                gap_to_ahead_s=round(gap, 3),
+                sector_delta_s=-0.214,
+                tyre_age_delta=0.0,
+                base_laptime_norm=1.0,
+                closing_speed_kph=round(closing, 1),
+                gap_distance_m=round(gap * (speed / 3.6), 1),
+                drs_available=drs,
+                defender_line_change_late=bool(gap < 0.45 and closing > 8.0),
+                front_axle_overlap=bool(gap < 0.35 and closing > 6.0),
+            )
+            setattr(state, "speed_kph", round(speed, 1))
+            setattr(state, "lap", int(lap))
+            setattr(state, "tyre_life_pct", round(tyre_life, 1))
+            setattr(state, "track_distance_m", round(t_in_lap * 5793.0, 1))
+            setattr(state, "in_braking_zone", in_braking)
+            setattr(state, "in_drs_zone", bool(drs))
+            setattr(state, "gear", v_dyn["gear"])
+            setattr(state, "rpm", v_dyn["rpm"])
+            setattr(state, "throttle", v_dyn["throttle"])
+            setattr(state, "brake", v_dyn["brake"])
+            setattr(state, "tyre_temps", v_dyn["tyre_temps"])
+            setattr(state, "telemetry_source", "REPLAY_MODE")
+
             yield state
             await asyncio.sleep(period)
 

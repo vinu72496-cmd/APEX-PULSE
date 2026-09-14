@@ -39,6 +39,8 @@ export default function CoachVoiceRadio({
   driverAudioState,
   activeDriverId,
   activeDriver,
+  commands = [],
+  activeCommand = null,
   onStartDirectCall,
   callState,
   onEndCall,
@@ -84,29 +86,89 @@ export default function CoachVoiceRadio({
   ])
 
   // Active Current Message State Machine
-  const [activeMessage, setActiveMessage] = useState({
-    id: 104,
-    time: '15:22:30',
-    coachMessage: 'Attack LEC +18 on brakes into Turn 1',
-    action: 'OVERTAKE',
-    urgency: 'CRITICAL',
-    stage: 'DELIVERED', // 'SENT' | 'DELIVERED' | 'ACKNOWLEDGED' | 'EXECUTED' | 'NOT_DETECTED'
-    sentTime: '15:22:30',
-    deliveredTime: '15:22:31',
-    ackTime: null,
-    driverResponse: null,
-    telemetryMatched: false,
-    executionEvidence: null,
+  const [activeMessage, setActiveMessage] = useState(() => {
+    if (activeCommand) {
+      return {
+        id: activeCommand.id,
+        time: activeCommand.time || activeCommand.sent_at,
+        coachMessage: activeCommand.message || activeCommand.call || activeCommand.transcript || 'Radio check nominal.',
+        action: activeCommand.action || 'RADIO CHECK',
+        urgency: activeCommand.urgency || 'INFO',
+        stage: activeCommand.status || 'DELIVERED',
+        sentTime: activeCommand.sent_at || activeCommand.time,
+        deliveredTime: activeCommand.delivered_at,
+        ackTime: activeCommand.acknowledged_at,
+        driverResponse: activeCommand.driver_reply,
+        telemetryMatched: false,
+        executionEvidence: null,
+      }
+    }
+    return {
+      id: 101,
+      time: '15:20:45',
+      coachMessage: 'Radio check nominal. Confirm audio loud and clear.',
+      action: 'RADIO CHECK',
+      urgency: 'INFO',
+      stage: 'ACKNOWLEDGED',
+      sentTime: '15:20:45',
+      deliveredTime: '15:20:46',
+      ackTime: '15:20:47',
+      driverResponse: '5 BY 5 - AUDIO LOUD & CLEAR',
+      telemetryMatched: true,
+      executionEvidence: 'Acoustic latency 12ms · Channel 1 nominal',
+    }
   })
 
   // Speech Recognition hook setup
   const recognitionRef = useRef(null)
   const hasSpeechRec = typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)
 
+  // Synchronize activeMessage with backend activeCommand in real time
+  useEffect(() => {
+    if (activeCommand && activeCommand.id) {
+      setActiveMessage((prev) => {
+        const backendStatus = activeCommand.status || 'SENT'
+        let stage = backendStatus
+        if (backendStatus === 'ACKNOWLEDGED' && prev?.stage === 'EXECUTED') {
+          stage = 'EXECUTED'
+        }
+        return {
+          id: activeCommand.id,
+          time: activeCommand.time || activeCommand.sent_at || prev?.time,
+          coachMessage: activeCommand.message || activeCommand.call || activeCommand.transcript || prev?.coachMessage,
+          action: activeCommand.action || prev?.action,
+          urgency: activeCommand.urgency || prev?.urgency || 'HIGH',
+          stage: stage,
+          sentTime: activeCommand.sent_at || prev?.sentTime,
+          deliveredTime: activeCommand.delivered_at || prev?.deliveredTime,
+          ackTime: activeCommand.acknowledged_at || prev?.ackTime,
+          driverResponse: activeCommand.driver_reply || prev?.driverResponse,
+          telemetryMatched: prev?.telemetryMatched || false,
+          executionEvidence: prev?.executionEvidence || null,
+        }
+      })
+    }
+  }, [activeCommand?.id, activeCommand?.status, activeCommand?.acknowledged_at, activeCommand?.delivered_at, activeCommand?.driver_reply])
+
+  // Headset audio chime when driver copy arrives
+  const prevAckIdRef = useRef(null)
+  useEffect(() => {
+    if (activeCommand && (activeCommand.status === 'ACKNOWLEDGED' || activeCommand.status === 'DECLINED')) {
+      const ackKey = `${activeCommand.id}_${activeCommand.status}`
+      if (prevAckIdRef.current !== ackKey) {
+        prevAckIdRef.current = ackKey
+        playDriverAckBeep()
+        if (activeCommand.driver_reply) {
+          speakDriverAck(activeCommand.driver_reply, audioEnabled)
+        }
+      }
+    }
+  }, [activeCommand?.id, activeCommand?.status, activeCommand?.driver_reply, audioEnabled])
+
   // Listen for parent / driver acknowledgements
   const lastDriverAck = driverAudioState?.lastAck ?? null
   useEffect(() => {
-    if (lastDriverAck && activeMessage && activeMessage.stage === 'DELIVERED') {
+    if (lastDriverAck && activeMessage && (activeMessage.stage === 'DELIVERED' || activeMessage.stage === 'SENT')) {
       handleDriverAcknowledge(lastDriverAck.reply)
     }
   }, [lastDriverAck?.id, lastDriverAck?.time])
@@ -256,23 +318,24 @@ export default function CoachVoiceRadio({
     executeRadioBroadcast(action, text, 'CRITICAL')
   }
 
-  // 1. Dispatch New Coach Message (SENT -> DELIVERED)
+  // 1. Dispatch New Coach Message (SENT -> DELIVERED -> ACKNOWLEDGED)
   const executeRadioBroadcast = (action, spokenText, urgency = 'NORMAL') => {
     playRadioBeep()
     speakRadioMessage(spokenText, audioEnabled)
 
     const now = new Date()
     const timeStr = now.toTimeString().split(' ')[0]
+    const msgId = Date.now()
 
     const newMsg = {
-      id: Date.now(),
+      id: msgId,
       time: timeStr,
       coachMessage: spokenText,
       action: action,
       urgency: urgency,
-      stage: 'SENDING',
+      stage: 'SENT',
       sendingTime: timeStr,
-      sentTime: null,
+      sentTime: timeStr,
       deliveredTime: null,
       readTime: null,
       ackTime: null,
@@ -291,48 +354,40 @@ export default function CoachVoiceRadio({
         time: timeStr,
         sender: 'PIT WALL COACH',
         call: spokenText,
+        message: spokenText,
         action: action,
         urgency: urgency,
+        status: 'SENT',
       })
     }
 
-    // Broadcast across server WebSocket to Driver cockpit in real time
-    fetch(getApiUrl('/api/radio/signal'), {
+    // Call unified command endpoint on backend
+    fetch(getApiUrl('/api/command/send'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         action: action,
         driver_id: activeDriverId || 'driver_2',
-        text: spokenText,
+        message: spokenText,
+        urgency: urgency,
+        coach_name: selectedCoach === 'bono' ? 'Peter Bonnington (Bono)' : 'Christian Horner',
       }),
-    }).catch(() => {})
-
-    // Stage 2: SENT after 200ms
-    setTimeout(() => {
-      setActiveMessage((prev) => {
-        if (!prev || prev.id !== newMsg.id) return prev
-        const t = new Date().toTimeString().split(' ')[0]
-        return { ...prev, stage: 'SENT', sentTime: t }
+    })
+      .then((r) => r.json())
+      .then((data) => {
+        if (data && data.command) {
+          setActiveMessage((prev) => {
+            if (!prev || String(prev.id) !== String(msgId)) return prev
+            return {
+              ...prev,
+              id: data.command.id,
+              stage: data.command.status || 'SENT',
+              sentTime: data.command.sent_at || timeStr,
+            }
+          })
+        }
       })
-    }, 200)
-
-    // Stage 3: DELIVERED after 500ms
-    setTimeout(() => {
-      setActiveMessage((prev) => {
-        if (!prev || prev.id !== newMsg.id) return prev
-        const t = new Date().toTimeString().split(' ')[0]
-        return { ...prev, stage: 'DELIVERED', deliveredTime: t }
-      })
-    }, 500)
-
-    // Stage 4: READ after 900ms
-    setTimeout(() => {
-      setActiveMessage((prev) => {
-        if (!prev || prev.id !== newMsg.id) return prev
-        const t = new Date().toTimeString().split(' ')[0]
-        return { ...prev, stage: 'READ', readTime: t }
-      })
-    }, 900)
+      .catch((err) => console.warn('Command dispatch error:', err))
   }
 
   // 2. Driver Acknowledgement Trigger (DELIVERED -> ACKNOWLEDGED)
@@ -368,20 +423,21 @@ export default function CoachVoiceRadio({
           executionEvidence: 'Driver acknowledged · Monitoring vehicle response',
           stage: 'ACKNOWLEDGED',
         },
-        ...hist.filter((h) => h.id !== updated.id).slice(0, 2),
+        ...hist.filter((h) => h.id !== updated.id).slice(0, 4),
       ])
 
       return updated
     })
 
     // Notify backend
-    fetch(getApiUrl('/api/radio/ack'), {
+    fetch(getApiUrl('/api/command/ack'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         id: activeMessage.id,
         action: activeMessage.action,
         reply: driverReply,
+        status: 'ACKNOWLEDGED',
         time: ackTimeStr,
       }),
     }).catch(() => {})
@@ -409,6 +465,40 @@ export default function CoachVoiceRadio({
     }
     return { text: 'CH 1: PIT → CAR', cls: 'standby' }
   }, [activeMessage?.stage])
+
+  // Live session command audit trail from backend
+  const displayHistory = useMemo(() => {
+    if (commands && commands.length > 0) {
+      return [...commands].reverse().map((c) => {
+        const isAck = c.status === 'ACKNOWLEDGED'
+        const isDel = c.status === 'DELIVERED'
+        const isDec = c.status === 'DECLINED'
+        return {
+          id: c.id,
+          time: c.time || c.sent_at || '--:--:--',
+          coachMessage: c.message || c.call || c.transcript || c.action,
+          driverResponse:
+            c.driver_reply ||
+            (c.status === 'SENT'
+              ? 'TRANSMITTING TO COCKPIT...'
+              : isDel
+              ? 'HEARD IN HELMET · AWAITING COPY'
+              : '--'),
+          status: isAck ? 'ACKNOWLEDGED ✓✓' : isDel ? 'DELIVERED ✓' : isDec ? 'DECLINED ✗' : 'SENT ●',
+          executionResult: isAck
+            ? 'ACTION CONFIRMED ✓✓'
+            : isDel
+            ? 'IN DRIVER EAR-PIECE'
+            : isDec
+            ? 'DECLINED BY DRIVER'
+            : 'DISPATCHED',
+          executionEvidence: c.latency_ms ? `Acoustic latency ${c.latency_ms}ms · Ch 1 verified` : 'Channel 1 nominal',
+          stage: c.status || 'SENT',
+        }
+      })
+    }
+    return commHistory
+  }, [commands, commHistory])
 
   return (
     <div className="coach-voice-radio-card f1-redesign">
@@ -1040,11 +1130,11 @@ export default function CoachVoiceRadio({
         </div>
       </div>
 
-      {/* 5. COMMUNICATION HISTORY (LAST 3 MESSAGES AUDIT LOG) */}
+      {/* 5. COMMUNICATION HISTORY (SESSION AUDIT LOG) */}
       <div className="comm-history-section">
         <div className="history-section-header">
-          <span className="hist-hdr-title">COMMUNICATION AUDIT TRAIL (LAST 3 MESSAGES)</span>
-          <span className="hist-hdr-sub">F1 RADIO TELEMETRY LOG</span>
+          <span className="hist-hdr-title">COMMUNICATION AUDIT TRAIL (SESSION LOG)</span>
+          <span className="hist-hdr-sub">F1 RADIO TELEMETRY LOG · {displayHistory.length} TRANSMISSIONS</span>
         </div>
 
         <div className="history-table-container">
@@ -1059,21 +1149,27 @@ export default function CoachVoiceRadio({
               </tr>
             </thead>
             <tbody>
-              {commHistory.slice(0, 3).map((item) => (
-                <tr key={item.id} className={`comm-tr ${item.stage.toLowerCase()}`}>
-                  <td className="time-td">{item.time}</td>
-                  <td className="msg-td">"{item.coachMessage}"</td>
-                  <td className="resp-td">
-                    <span className="resp-bubble">"{item.driverResponse}"</span>
-                  </td>
-                  <td className="status-td">
-                    <span className="status-badge green">{item.status}</span>
-                  </td>
-                  <td className="exec-td">
-                    <span className="exec-badge green">{item.executionResult}</span>
-                  </td>
-                </tr>
-              ))}
+              {displayHistory.slice(0, 10).map((item) => {
+                const isAck = item.stage === 'ACKNOWLEDGED' || item.stage === 'EXECUTED'
+                const isDel = item.stage === 'DELIVERED'
+                const isDec = item.stage === 'DECLINED'
+                const badgeCls = isAck ? 'green' : (isDel ? 'blue' : (isDec ? 'red' : 'amber'))
+                return (
+                  <tr key={item.id} className={`comm-tr ${item.stage.toLowerCase()}`}>
+                    <td className="time-td">{item.time}</td>
+                    <td className="msg-td">"{item.coachMessage}"</td>
+                    <td className="resp-td">
+                      <span className="resp-bubble">"{item.driverResponse}"</span>
+                    </td>
+                    <td className="status-td">
+                      <span className={`status-badge ${badgeCls}`}>{item.status}</span>
+                    </td>
+                    <td className="exec-td">
+                      <span className={`exec-badge ${badgeCls}`}>{item.executionResult}</span>
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </div>

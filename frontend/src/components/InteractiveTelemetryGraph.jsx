@@ -14,13 +14,13 @@ export default function InteractiveTelemetryGraph({
 }) {
   const [activeTab, setActiveTab] = useState('SPEED')
 
-  // Live sensor values
-  const speed = Math.round(Number(decision?.speed_kph ?? 318))
-  const throttle = speed > 260 ? Math.min(100, Math.max(85, Math.round(92 + (speed % 7)))) : 65
-  const brake = throttle > 75 ? 0 : Math.round(100 - throttle)
-  const rpm = Math.min(12400, Math.max(10400, Math.round(10800 + (speed % 25) * 48)))
+  // Live sensor values directly from verified telemetry pipeline (no modulo jitter!)
+  const speed = Math.round(Number(decision?.speed_kph ?? (history.speed?.length ? history.speed[history.speed.length - 1] : 318)))
+  const throttle = Math.round(Number(decision?.throttle ?? (history.throttle?.length ? history.throttle[history.throttle.length - 1] : (speed > 260 ? 95 : 65))))
+  const brake = Math.round(Number(decision?.brake ?? (history.brake?.length ? history.brake[history.brake.length - 1] : 0)))
+  const rpm = Math.round(Number(decision?.rpm ?? (history.rpm?.length ? history.rpm[history.rpm.length - 1] : 11200)))
   const soc = Math.round(Number(decision?.soc ?? 0.85) * 100)
-  const tyreTemp = Math.round(decision?.tyre_temps?.fl ?? 102)
+  const tyreTemp = Math.round(Number(decision?.tyre_temps?.fl ?? (history.tyreTemp?.length ? history.tyreTemp[history.tyreTemp.length - 1] : 102)))
 
   // Configure active channel specifications
   const channel = useMemo(() => {
@@ -35,7 +35,7 @@ export default function InteractiveTelemetryGraph({
           max: 100,
           avg: 74,
           refCurrent: 88,
-          data: history.speed.map((s) => (s > 260 ? Math.min(100, 88 + (s % 12)) : 55)),
+          data: history.throttle && history.throttle.length > 0 ? history.throttle : [60, 75, 85, 92, 98, 100],
         }
       case 'BRAKE':
         return {
@@ -47,7 +47,7 @@ export default function InteractiveTelemetryGraph({
           max: 100,
           avg: 18,
           refCurrent: 0,
-          data: history.speed.map((s) => (s < 260 ? 85 : 0)),
+          data: history.brake && history.brake.length > 0 ? history.brake : [0, 0, 0, 0, 0, 0],
         }
       case 'RPM':
         return {
@@ -55,11 +55,11 @@ export default function InteractiveTelemetryGraph({
           unit: 'RPM',
           current: rpm.toLocaleString(),
           color: '#FFB300',
-          min: '9,400',
-          max: '12,250',
-          avg: '10,850',
-          refCurrent: '11,100',
-          data: history.speed.map((s) => 10400 + (s % 25) * 55),
+          min: '10,200',
+          max: '12,500',
+          avg: '11,400',
+          refCurrent: '11,850',
+          data: history.rpm && history.rpm.length > 0 ? history.rpm : [10800, 11100, 11400, 11800, 12100],
         }
       case 'ERS':
         return {
@@ -83,7 +83,7 @@ export default function InteractiveTelemetryGraph({
           max: 114,
           avg: 99,
           refCurrent: 101,
-          data: history.speed.map((s) => 94 + (s % 14)),
+          data: history.tyreTemp && history.tyreTemp.length > 0 ? history.tyreTemp : [98, 99, 101, 102, 103],
         }
       case 'SPEED':
       default:

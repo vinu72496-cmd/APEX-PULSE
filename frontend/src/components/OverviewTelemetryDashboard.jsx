@@ -397,6 +397,17 @@ export default function OverviewTelemetryDashboard({
                 <span className="ai-val-cyan">DUAL-MODEL CORE 20Hz · {decision?.action || 'MONITORING'}</span>
               </div>
 
+              {/* Telemetry Source Badge */}
+              <div className="status-chip telemetry-source-chip" style={{ background: 'rgba(0, 229, 255, 0.08)', border: '1px solid rgba(0, 229, 255, 0.25)', padding: '4px 10px', borderRadius: '4px', display: 'flex', alignItems: 'center' }}>
+                <span className="source-dot" style={{ display: 'inline-block', width: '7px', height: '7px', borderRadius: '50%', background: '#00e5ff', marginRight: '6px', boxShadow: '0 0 8px #00e5ff' }} />
+                <span className="chip-label" style={{ fontSize: '10px', color: '#94a3b8', fontWeight: 'bold' }}>DATA:</span>
+                <span style={{ fontSize: '10px', fontWeight: '800', color: '#00e5ff', marginLeft: '4px' }}>
+                  {decision?.telemetry_source === 'PHYSICS_SIMULATION'
+                    ? 'LIVE PHYSICS SIMULATION'
+                    : 'REPLAY MODE · MONZA GP (90,002 Laps)'}
+                </span>
+              </div>
+
               {/* Key Telemetry Badges */}
               <div className="key-telemetry-cluster">
                 <div className="telemetry-badge speed">

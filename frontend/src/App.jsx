@@ -111,13 +111,20 @@ export default function App() {
 
   const [history, setHistory] = useState({
     speed: [],
+    rpm: [],
+    gear: [],
+    throttle: [],
+    brake: [],
     soc: [],
     gap: [],
     power: [],
     pace: [],
+    tyreTemp: [],
   })
   const [complianceLogs, setComplianceLogs] = useState([])
   const [radioMessage, setRadioMessage] = useState(null)
+  const [commands, setCommands] = useState([])
+  const [activeCommand, setActiveCommand] = useState(null)
   const [driverAudioState, setDriverAudioState] = useState({
     connected: true,
     isHearing: false,
@@ -125,6 +132,22 @@ export default function App() {
     lastAck: null,
   })
   const wsRef = useRef(null)
+
+  // Fetch session commands history on load
+  useEffect(() => {
+    fetch(getApiUrl('/api/commands'))
+      .then((res) => res.json())
+      .then((data) => {
+        if (data && data.commands) {
+          setCommands(data.commands)
+          if (data.active_command) {
+            setActiveCommand(data.active_command)
+            setRadioMessage(data.active_command)
+          }
+        }
+      })
+      .catch((err) => console.warn('Could not fetch command history:', err))
+  }, [])
 
   // Demo Scenario Handler
   const handleSelectScenario = (key) => {
@@ -195,7 +218,19 @@ export default function App() {
   }, [effectiveDecision])
 
   const handleRadioBroadcast = (msg) => {
-    setRadioMessage(msg)
+    const formatted = {
+      ...msg,
+      status: msg.status || 'SENT',
+      message: msg.call || msg.message || msg.transcript || msg.action,
+      sent_at: msg.time || new Date().toTimeString().split(' ')[0],
+    }
+    setRadioMessage(formatted)
+    setActiveCommand(formatted)
+    setCommands((prev) => {
+      const exists = prev.some((c) => String(c.id) === String(formatted.id))
+      if (exists) return prev.map((c) => (String(c.id) === String(formatted.id) ? { ...c, ...formatted } : c))
+      return [...prev.slice(-49), formatted]
+    })
     if (['OVERTAKE', 'PUSH', 'BALANCE', 'HARVEST'].includes(msg.action)) {
       setDecision((prev) => (prev ? { ...prev, mode: msg.action } : prev))
     }
@@ -210,16 +245,41 @@ export default function App() {
   }
 
   const handleDriverAcknowledge = (ack) => {
+    const timeStr = ack.time || new Date().toTimeString().split(' ')[0]
+    const ackStatus = ack.status || 'ACKNOWLEDGED'
+    const replyText = ack.reply || 'COPY THAT / EXECUTING'
+
     setDriverAudioState((prev) => ({
       ...prev,
       isHearing: false,
       hearingStatus: 'ONLINE & LISTENING',
       lastAck: ack,
     }))
-    fetch(getApiUrl('/api/radio/ack'), {
+
+    setActiveCommand((prev) =>
+      prev ? { ...prev, status: ackStatus, driver_reply: replyText, acknowledged_at: timeStr } : null
+    )
+    setRadioMessage((prev) =>
+      prev ? { ...prev, status: ackStatus, driver_reply: replyText, acknowledged_at: timeStr } : null
+    )
+    setCommands((prev) =>
+      prev.map((c) =>
+        String(c.id) === String(ack.id)
+          ? { ...c, status: ackStatus, driver_reply: replyText, acknowledged_at: timeStr }
+          : c
+      )
+    )
+
+    fetch(getApiUrl('/api/command/ack'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(ack),
+      body: JSON.stringify({
+        id: ack.id,
+        action: ack.action,
+        reply: replyText,
+        status: ackStatus,
+        time: timeStr,
+      }),
     }).catch(() => {})
   }
 
@@ -261,15 +321,81 @@ export default function App() {
             coachCallManager.handleWsEvent(data)
             driverCallManager.handleWsEvent(data)
           }
-          if (data.type === 'radio_signal') {
-            setRadioMessage({
-              id: data.signal.id,
-              sender: data.signal.sender || 'PIT WALL COACH',
-              transcript: data.signal.speech,
-              action: data.signal.action,
-              urgency: 'HIGH',
-            })
+          // Command Engine Lifecycle Dispatch
+          if (data.type === 'command_update') {
+            const cmd = data.command
+            if (cmd) {
+              setActiveCommand(cmd)
+              setRadioMessage(cmd)
+              setCommands((prev) => {
+                const idx = prev.findIndex(
+                  (c) => String(c.id) === String(cmd.id) || String(c.command_id) === String(cmd.command_id)
+                )
+                if (idx >= 0) {
+                  const updated = [...prev]
+                  updated[idx] = { ...updated[idx], ...cmd }
+                  return updated
+                }
+                return [...prev.slice(-49), cmd]
+              })
+              if (cmd.status === 'ACKNOWLEDGED' || cmd.status === 'DECLINED') {
+                setDriverAudioState((prev) => ({
+                  ...prev,
+                  lastAck: {
+                    id: cmd.id,
+                    reply: cmd.driver_reply,
+                    status: cmd.status,
+                    time: cmd.acknowledged_at || cmd.time,
+                  },
+                }))
+              }
+            }
           }
+
+          if (data.type === 'radio_ack') {
+            const ack = data.ack
+            if (ack) {
+              setDriverAudioState((prev) => ({
+                ...prev,
+                lastAck: ack,
+              }))
+              setActiveCommand((prev) =>
+                prev && String(prev.id) === String(ack.id)
+                  ? { ...prev, status: ack.status || 'ACKNOWLEDGED', acknowledged_at: ack.time, driver_reply: ack.reply }
+                  : prev
+              )
+              setRadioMessage((prev) =>
+                prev && String(prev.id) === String(ack.id)
+                  ? { ...prev, status: ack.status || 'ACKNOWLEDGED', acknowledged_at: ack.time, driver_reply: ack.reply }
+                  : prev
+              )
+              setCommands((prev) =>
+                prev.map((c) =>
+                  String(c.id) === String(ack.id)
+                    ? { ...c, status: ack.status || 'ACKNOWLEDGED', acknowledged_at: ack.time, driver_reply: ack.reply }
+                    : c
+                )
+              )
+            }
+          }
+
+          if (data.type === 'radio_signal') {
+            const sig = data.signal || data
+            const formatted = {
+              id: sig.id,
+              sender: sig.sender || 'PIT WALL COACH',
+              message: sig.speech || sig.text,
+              call: sig.speech || sig.text,
+              transcript: sig.speech || sig.text,
+              action: sig.action,
+              urgency: 'HIGH',
+              status: 'SENT',
+            }
+            setActiveCommand(formatted)
+            setRadioMessage(formatted)
+            setCommands((prev) => [...prev.slice(-49), formatted])
+          }
+
           if (data.type === 'decision' || data.mode) {
             const sanitized = sanitizeDecisionData(data)
             if (data.drivers) {
@@ -277,24 +403,47 @@ export default function App() {
             }
             setDecision(sanitized)
 
-            if (data.radio_message) {
+            if (data.active_command) {
+              setActiveCommand(data.active_command)
+              setRadioMessage(data.active_command)
+            } else if (data.radio_message) {
               setRadioMessage(data.radio_message)
+              setActiveCommand((prev) => prev || data.radio_message)
+            }
+
+            if (data.commands && Array.isArray(data.commands) && data.commands.length > 0) {
+              setCommands((prev) => {
+                const map = new Map()
+                prev.forEach((c) => map.set(String(c.id), c))
+                data.commands.forEach((c) => map.set(String(c.id), { ...(map.get(String(c.id)) || {}), ...c }))
+                return Array.from(map.values()).slice(-50)
+              })
             }
 
             // Update rolling history buffer (last 60 ticks)
             setHistory((prev) => {
               const speedVal = data.speed_kph ?? 312
+              const rpmVal = data.rpm ?? (10400 + Math.round(((speedVal % 25) * 55)))
+              const gearVal = data.gear ?? (speedVal > 300 ? 8 : (speedVal > 260 ? 7 : 6))
+              const throttleVal = data.throttle ?? (speedVal > 260 ? 95 : 65)
+              const brakeVal = data.brake ?? 0
               const socVal = Math.round((data.soc ?? 0) * 100)
               const gapVal = Number(data.gap_ahead_s ?? data.gap_to_ahead_s ?? 0.38)
               const powerVal = Number(data.mguk_power_kw ?? 0)
               const paceVal = typeof data.sector_delta_s === 'number' ? -data.sector_delta_s : -0.214
+              const tyreTempVal = Number(data.tyre_temps?.fl ?? 102)
 
               return {
-                speed: [...prev.speed.slice(-MAX_HISTORY + 1), speedVal],
-                soc: [...prev.soc.slice(-MAX_HISTORY + 1), socVal],
-                gap: [...prev.gap.slice(-MAX_HISTORY + 1), gapVal],
-                power: [...prev.power.slice(-MAX_HISTORY + 1), powerVal],
-                pace: [...prev.pace.slice(-MAX_HISTORY + 1), paceVal],
+                speed: [...(prev.speed || []).slice(-MAX_HISTORY + 1), speedVal],
+                rpm: [...(prev.rpm || []).slice(-MAX_HISTORY + 1), rpmVal],
+                gear: [...(prev.gear || []).slice(-MAX_HISTORY + 1), gearVal],
+                throttle: [...(prev.throttle || []).slice(-MAX_HISTORY + 1), throttleVal],
+                brake: [...(prev.brake || []).slice(-MAX_HISTORY + 1), brakeVal],
+                soc: [...(prev.soc || []).slice(-MAX_HISTORY + 1), socVal],
+                gap: [...(prev.gap || []).slice(-MAX_HISTORY + 1), gapVal],
+                power: [...(prev.power || []).slice(-MAX_HISTORY + 1), powerVal],
+                pace: [...(prev.pace || []).slice(-MAX_HISTORY + 1), paceVal],
+                tyreTemp: [...(prev.tyreTemp || []).slice(-MAX_HISTORY + 1), tyreTempVal],
               }
             })
 
@@ -477,7 +626,9 @@ export default function App() {
             <DriverDashboard
               decision={effectiveDecision}
               connected={connected}
-              radioMessage={radioMessage}
+              radioMessage={activeCommand || radioMessage}
+              commands={commands}
+              activeCommand={activeCommand}
               onAcknowledgeRadio={handleDriverAcknowledge}
               onHearingStateChange={handleDriverHearingChange}
             />
@@ -497,6 +648,8 @@ export default function App() {
               decision={effectiveDecision}
               history={history}
               complianceLogs={complianceLogs}
+              commands={commands}
+              activeCommand={activeCommand}
               onRadioBroadcast={handleRadioBroadcast}
               driverAudioState={driverAudioState}
             />
@@ -536,7 +689,7 @@ export default function App() {
               <HorizontalRaceTimeline decision={effectiveDecision} />
             </div>
             <div className="layout-col col-graphs">
-              <InteractiveTelemetryGraph decision={effectiveDecision} />
+              <InteractiveTelemetryGraph decision={effectiveDecision} history={history} />
               <DriverTelemetryPanel
                 decision={effectiveDecision}
                 recommendedAction={recommendedAction}
@@ -604,7 +757,7 @@ export default function App() {
                             decision={effectiveDecision} 
                             lap={effectiveDecision?.lap ?? 30} 
                           />
-                          <InteractiveTelemetryGraph decision={effectiveDecision} />
+                          <InteractiveTelemetryGraph decision={effectiveDecision} history={history} />
                           <HorizontalRaceTimeline decision={effectiveDecision} />
                         </div>
                         <div className="layout-col col-right">
@@ -643,7 +796,9 @@ export default function App() {
                   <DriverDashboard
                     decision={effectiveDecision}
                     connected={connected}
-                    radioMessage={radioMessage}
+                    radioMessage={activeCommand || radioMessage}
+                    commands={commands}
+                    activeCommand={activeCommand}
                     onAcknowledgeRadio={handleDriverAcknowledge}
                     onHearingStateChange={handleDriverHearingChange}
                   />
@@ -699,6 +854,8 @@ export default function App() {
                     decision={effectiveDecision}
                     history={history}
                     complianceLogs={complianceLogs}
+                    commands={commands}
+                    activeCommand={activeCommand}
                     onRadioBroadcast={handleRadioBroadcast}
                     driverAudioState={driverAudioState}
                   />

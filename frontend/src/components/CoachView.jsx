@@ -16,6 +16,8 @@ export default function CoachView({
   decision,
   history = { speed: [], soc: [], gap: [], power: [], pace: [] },
   complianceLogs = [],
+  commands = [],
+  activeCommand = null,
   onRadioBroadcast,
   driverAudioState,
 }) {
@@ -25,6 +27,8 @@ export default function CoachView({
         decision={decision}
         history={history}
         complianceLogs={complianceLogs}
+        commands={commands}
+        activeCommand={activeCommand}
         onRadioBroadcast={onRadioBroadcast}
         driverAudioState={driverAudioState}
       />

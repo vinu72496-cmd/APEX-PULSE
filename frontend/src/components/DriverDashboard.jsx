@@ -142,19 +142,47 @@ export default function DriverDashboard({
 
   // Watch for incoming radioMessage from pit wall coach and synthesize voice aloud in cockpit
   useEffect(() => {
-    if (radioMessage && radioMessage.id && radioMessage.id !== driverMessageState.id) {
-      setDriverMessageState({
-        id: radioMessage.id,
-        status: 'PENDING',
-        replyText: '',
-      })
-      playRadioBeep()
-      const textToSpeak = radioMessage.transcript || radioMessage.speech || radioMessage.call || radioMessage.coachMessage
-      if (textToSpeak) {
-        speakRadioMessage(textToSpeak, true)
+    if (radioMessage && radioMessage.id) {
+      const isAlreadyAcked =
+        radioMessage.status === 'ACKNOWLEDGED' || radioMessage.status === 'ACCEPTED'
+      const isAlreadyDeclined = radioMessage.status === 'DECLINED'
+
+      if (isAlreadyAcked) {
+        setDriverMessageState({
+          id: radioMessage.id,
+          status: 'ACCEPTED',
+          replyText: radioMessage.driver_reply || 'COPY THAT / EXECUTING',
+        })
+        setAcknowledged(true)
+      } else if (isAlreadyDeclined) {
+        setDriverMessageState({
+          id: radioMessage.id,
+          status: 'DECLINED',
+          replyText: radioMessage.driver_reply || 'UNABLE TO COMPLY',
+        })
+      } else if (radioMessage.id !== driverMessageState.id) {
+        setDriverMessageState({
+          id: radioMessage.id,
+          status: 'PENDING',
+          replyText: '',
+        })
+        setAcknowledged(false)
+        playRadioBeep()
+        const textToSpeak =
+          radioMessage.transcript || radioMessage.speech || radioMessage.call || radioMessage.coachMessage || radioMessage.message
+        if (textToSpeak) {
+          speakRadioMessage(textToSpeak, true)
+        }
+
+        // Send instant delivery confirmation to pit wall coach
+        fetch(getApiUrl('/api/command/delivered'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: radioMessage.id }),
+        }).catch(() => {})
       }
     }
-  }, [radioMessage?.id])
+  }, [radioMessage?.id, radioMessage?.status, radioMessage?.driver_reply])
 
   const handleAcceptDirective = () => {
     playDriverAckBeep()
@@ -177,11 +205,11 @@ export default function DriverDashboard({
         reply: reply,
         time: timeStr,
         lap: lap,
-        status: 'ACCEPTED',
+        status: 'ACKNOWLEDGED',
       })
     }
 
-    fetch(getApiUrl('/api/radio/ack'), {
+    fetch(getApiUrl('/api/command/ack'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -218,7 +246,7 @@ export default function DriverDashboard({
       })
     }
 
-    fetch(getApiUrl('/api/radio/ack'), {
+    fetch(getApiUrl('/api/command/ack'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

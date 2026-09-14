@@ -5,6 +5,7 @@ import {
   speakDriverAck,
   getDriverResponseForAction,
 } from '../utils/radioAudio.js'
+import { getApiUrl } from '../config.js'
 
 export default function DriverRadioBanner({
   radioMessage,
@@ -16,7 +17,13 @@ export default function DriverRadioBanner({
   const [isPlayingAudio, setIsPlayingAudio] = useState(false)
 
   useEffect(() => {
-    if (radioMessage) {
+    if (radioMessage && radioMessage.id) {
+      const isAcked = radioMessage.status === 'ACKNOWLEDGED' || radioMessage.status === 'ACCEPTED'
+      if (isAcked) {
+        setAcknowledged(true)
+        return
+      }
+
       setVisible(true)
       setAcknowledged(false)
       setIsPlayingAudio(true)
@@ -26,7 +33,14 @@ export default function DriverRadioBanner({
         onHearingStateChange({ id: radioMessage.id, isHearing: true, status: 'AUDIO PLAYING IN HELMET' })
       }
 
-      // Simulate the duration of voice readout (approx 3.5 seconds)
+      // Send immediate delivery confirmation to pit wall coach
+      fetch(getApiUrl('/api/command/delivered'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: radioMessage.id }),
+      }).catch(() => {})
+
+      // Voice readout duration in driver helmet
       const audioTimer = setTimeout(() => {
         setIsPlayingAudio(false)
         if (onHearingStateChange) {
@@ -34,17 +48,11 @@ export default function DriverRadioBanner({
         }
       }, 3500)
 
-      // Auto-dismiss after 9 seconds if driver doesn't tap acknowledge
-      const dismissTimer = setTimeout(() => {
-        setVisible(false)
-      }, 9000)
-
       return () => {
         clearTimeout(audioTimer)
-        clearTimeout(dismissTimer)
       }
     }
-  }, [radioMessage?.id])
+  }, [radioMessage?.id, radioMessage?.status])
 
   if (!visible || !radioMessage) return null
 
@@ -68,7 +76,19 @@ export default function DriverRadioBanner({
       })
     }
 
-    setTimeout(() => setVisible(false), 2500)
+    fetch(getApiUrl('/api/command/ack'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: radioMessage.id,
+        action: radioMessage.action,
+        reply: driverReply,
+        status: 'ACKNOWLEDGED',
+        time: timeStr,
+      }),
+    }).catch(() => {})
+
+    setTimeout(() => setVisible(false), 3000)
   }
 
   return (

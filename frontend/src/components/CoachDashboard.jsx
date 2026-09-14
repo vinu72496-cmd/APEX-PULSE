@@ -20,6 +20,8 @@ export default function CoachDashboard({
   decision,
   history = { speed: [], soc: [], gap: [], power: [], pace: [] },
   complianceLogs = [],
+  commands = [],
+  activeCommand = null,
   onRadioBroadcast,
   driverAudioState,
 }) {
@@ -287,6 +289,8 @@ export default function CoachDashboard({
             onRadioBroadcast={onRadioBroadcast}
             decision={effectiveDecision}
             driverAudioState={driverAudioState}
+            commands={commands}
+            activeCommand={activeCommand}
             activeDriverId={activeDriverId}
             activeDriver={activeDriver}
             onStartDirectCall={handleStartDirectCall}
