@@ -16282,3 +16282,40 @@ html {
     justify-content: center;
   }
 }
+
+@media (max-width: 768px) {
+  .driver-radio-hud {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    padding: 12px 14px;
+  }
+
+  .radio-hud-left {
+    width: 100%;
+  }
+
+  .radio-hud-right {
+    width: 100%;
+  }
+
+  .radio-ack-btn {
+    width: 100%;
+    min-height: 48px;
+    font-size: 13px;
+    letter-spacing: 0.5px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+
+  .coach-voice-radio-container {
+    padding: 12px;
+  }
+
+  .coach-comm-history table {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+}
